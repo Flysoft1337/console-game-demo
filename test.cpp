@@ -1,213 +1,232 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
-#include <array>
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <string>
+#include <vector>
 using namespace std;
 
 bool KeyPressed(int key){
     return GetAsyncKeyState(key) & 0x8000;
 }
+
 int main(){
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-    CONSOLE_CURSOR_INFO cursorInfo;
-    cursorInfo.dwSize = 1;
-    cursorInfo.bVisible = FALSE;
-    SetConsoleCursorInfo(hConsole, &cursorInfo);
-    
-    //定义范围
-    const int ACTIVE_W = 128;
-    const int ACTIVE_H = 32;
-    const int INFO_STARTPOS = ACTIVE_W;
-    const int INFO_W = 96;
-    const int BUF_W = ACTIVE_W + INFO_W;
-    const int BUF_H = ACTIVE_H;
+    CONSOLE_SCREEN_BUFFER_INFO consoleInfo;
+    if(!GetConsoleScreenBufferInfo(hConsole, &consoleInfo)){
+        fputs("PYS requires an interactive Windows console.\n", stderr);
+        return 1;
+    }
+    CONSOLE_CURSOR_INFO originalCursor;
+    bool restoreCursor = GetConsoleCursorInfo(hConsole, &originalCursor) != FALSE;
+    CONSOLE_CURSOR_INFO hiddenCursor = {1, FALSE};
+    SetConsoleCursorInfo(hConsole, &hiddenCursor);
 
-    //定义物资
-    bool resource[ACTIVE_H][ACTIVE_W] = {false};
-    int remainResource = 0;
-    srand((unsigned int)time(NULL));
+    const int MAP_W = 128;
+    const int MAP_H = 32;
     const int RESOURCE_RATE = 6;
-    for(int y = 0; y < ACTIVE_H; y++){
-        for(int x = 0; x < ACTIVE_W; x++){
+    bool resource[MAP_H][MAP_W] = {};
+    int remainResource = 0;
+    srand(static_cast<unsigned int>(time(nullptr)));
+    for(int row = 0; row < MAP_H; row++){
+        for(int column = 0; column < MAP_W; column++){
             if(rand() % 100 < RESOURCE_RATE){
-                resource[y][x] = true;
+                resource[row][column] = true;
                 remainResource++;
             }
         }
     }
 
-    //缓冲区
-    COORD bufferSize;
-    bufferSize.X = BUF_W;
-    bufferSize.Y = BUF_H;
-    SetConsoleScreenBufferSize(hConsole, bufferSize);
-    
-    //可视化窗口
-    SMALL_RECT windowRect;
-    windowRect.Left = 0;
-    windowRect.Top = 0;
-    windowRect.Right = BUF_W - 1;
-    windowRect.Bottom = BUF_H - 1;
-    SetConsoleWindowInfo(hConsole, TRUE, &windowRect);
-    
-    //在内存中合成画面,只提交发生变化的矩形区域。
-    CONSOLE_SCREEN_BUFFER_INFO consoleInfo;
-    WORD attributes = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
-    if(GetConsoleScreenBufferInfo(hConsole, &consoleInfo))
-        attributes = consoleInfo.wAttributes;
-    array<CHAR_INFO, BUF_W * BUF_H> frame{};
-    for(auto& cell : frame){
-        cell.Char.AsciiChar = ' ';
-        cell.Attributes = attributes;
-    }
-    SMALL_RECT dirty = {0, 0, BUF_W - 1, BUF_H - 1};
+    //画面坐标相对可见窗口,不修改终端尺寸或窗口样式。
+    SMALL_RECT viewport = {-1, -1, -1, -1};
+    COORD bufferSize = {};
+    CHAR_INFO blank = {};
+    blank.Char.AsciiChar = ' ';
+    blank.Attributes = consoleInfo.wAttributes;
+    vector<CHAR_INFO> frame;
+    vector<CHAR_INFO> displayed;
+    bool needsPresent = false;
+    bool forceRedraw = true;
     auto setCell = [&](int column, int row, char value){
-        auto& cell = frame[row * BUF_W + column];
-        if(cell.Char.AsciiChar == value)
-            return;
-        cell.Char.AsciiChar = value;
-        if(column < dirty.Left) dirty.Left = column;
-        if(column > dirty.Right) dirty.Right = column;
-        if(row < dirty.Top) dirty.Top = row;
-        if(row > dirty.Bottom) dirty.Bottom = row;
+        if(column >= 0 && column < bufferSize.X && row >= 0 && row < bufferSize.Y)
+            frame[row * bufferSize.X + column].Char.AsciiChar = value;
     };
     auto writeText = [&](int column, int row, const string& text, int width){
-        for(int offset = 0; offset < width; offset++){
-            char value = offset < static_cast<int>(text.size()) ? text[offset] : ' ';
-            setCell(column + offset, row, value);
-        }
+        int count = min(width, static_cast<int>(text.size()));
+        for(int offset = 0; offset < count; offset++)
+            setCell(column + offset, row, text[offset]);
     };
     auto present = [&](){
-        if(dirty.Left > dirty.Right || dirty.Top > dirty.Bottom)
+        if(!needsPresent)
             return;
-        //API 会修改目标矩形,使用副本以便失败时保留待绘区域。
-        SMALL_RECT target = dirty;
-        COORD source = {dirty.Left, dirty.Top};
-        if(WriteConsoleOutputA(hConsole, frame.data(), bufferSize, source, &target))
-            dirty = SMALL_RECT{BUF_W, BUF_H, -1, -1};
-    };
-
-    //绘制资源
-    auto drawResources = [&](){
-        for(int y = 0; y < ACTIVE_H; y++){
-            for(int x = 0; x < ACTIVE_W; x++){
-                if(resource[y][x])
-                    setCell(x, y, '#');
+        SMALL_RECT dirty = {bufferSize.X, bufferSize.Y, -1, -1};
+        if(forceRedraw){
+            dirty = SMALL_RECT{0, 0, static_cast<SHORT>(bufferSize.X - 1),
+                                   static_cast<SHORT>(bufferSize.Y - 1)};
+        }
+        else{
+            //比较最终画面,避免把合成过程中的临时变化提交给终端。
+            for(int row = 0; row < bufferSize.Y; row++){
+                for(int column = 0; column < bufferSize.X; column++){
+                    int index = row * bufferSize.X + column;
+                    if(frame[index].Char.AsciiChar == displayed[index].Char.AsciiChar)
+                        continue;
+                    dirty.Left = static_cast<SHORT>(min<int>(dirty.Left, column));
+                    dirty.Right = static_cast<SHORT>(max<int>(dirty.Right, column));
+                    dirty.Top = static_cast<SHORT>(min<int>(dirty.Top, row));
+                    dirty.Bottom = static_cast<SHORT>(max<int>(dirty.Bottom, row));
+                }
             }
         }
-    };
-
-    auto clearScreen = [&](){
-        for(int row = 0; row < BUF_H; row++){
-            for(int column = 0; column < BUF_W; column++)
-                setCell(column, row, ' ');
+        if(dirty.Left > dirty.Right || dirty.Top > dirty.Bottom){
+            needsPresent = false;
+            return;
+        }
+        COORD source = {dirty.Left, dirty.Top};
+        SMALL_RECT target = {
+            static_cast<SHORT>(viewport.Left + dirty.Left),
+            static_cast<SHORT>(viewport.Top + dirty.Top),
+            static_cast<SHORT>(viewport.Left + dirty.Right),
+            static_cast<SHORT>(viewport.Top + dirty.Bottom)
+        };
+        SMALL_RECT written = target;
+        if(WriteConsoleOutputA(hConsole, frame.data(), bufferSize, source, &written) &&
+           written.Left == target.Left && written.Top == target.Top &&
+           written.Right == target.Right && written.Bottom == target.Bottom){
+            displayed = frame;
+            needsPresent = false;
+            forceRedraw = false;
+        }
+        else{
+            //窗口可能在查询尺寸和提交之间变化,下一帧保留并重试。
+            forceRedraw = true;
         }
     };
-    auto writeInfo = [&](int row, const string& text){
-        writeText(INFO_STARTPOS, row, text, INFO_W);
-    };
-    
-    //禁止拖拽
-    HWND hWdn = GetConsoleWindow();
-    LONG style = GetWindowLongA(hWdn, GWL_STYLE);
-    style &= ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
-    SetWindowLongA(hWdn, GWL_STYLE, style);
-    
-    //基础设置
+
     int x = 10;
     int y = 10;
     int resourceCount = 0;
     int scene = 0;
-    bool firstFrame = true;
-
-    //游戏循环
+    int exitCode = 0;
     while(true){
         if(KeyPressed('Q'))
             break;
+        if(!GetConsoleScreenBufferInfo(hConsole, &consoleInfo)){
+            exitCode = 1;
+            break;
+        }
+        const SMALL_RECT current = consoleInfo.srWindow;
+        bool resized = current.Left != viewport.Left || current.Top != viewport.Top ||
+                       current.Right != viewport.Right || current.Bottom != viewport.Bottom;
+        if(resized){
+            viewport = current;
+            bufferSize.X = viewport.Right - viewport.Left + 1;
+            bufferSize.Y = viewport.Bottom - viewport.Top + 1;
+            frame.assign(static_cast<size_t>(bufferSize.X) * bufferSize.Y, blank);
+            displayed = frame;
+            forceRedraw = true;
+            needsPresent = true;
+        }
+        int width = bufferSize.X;
+        int height = bufferSize.Y;
+        bool canPlay = width >= 32 && height >= 12;
         int oldScene = scene;
-        if(KeyPressed(VK_RIGHT)){
-            scene = 1;
-        }
-        if(KeyPressed(VK_LEFT)){
-            scene = 0;
-        }
-        bool sceneChanged = firstFrame || scene != oldScene;
-        if(sceneChanged){
-            clearScreen();
-            if(scene == 0)
-                drawResources();
-        }
-        if(scene == 0){
-            int oldX = x;
-            int oldY = y;
-            int oldResourceCount = resourceCount;
-            int oldRemainResource = remainResource;
+        int oldX = x;
+        int oldY = y;
+        int oldResourceCount = resourceCount;
+        int oldRemainResource = remainResource;
+        if(KeyPressed(VK_RIGHT)) scene = 1;
+        if(KeyPressed(VK_LEFT)) scene = 0;
+        if(canPlay && scene == 0){
             if(remainResource <= 50){
-                for(int yy = 0; yy < ACTIVE_H; yy++){
-                    for (int xx = 0; xx < ACTIVE_W; xx++){
-                        if(!resource[yy][xx]){
-                            if(rand() % 100 < RESOURCE_RATE){
-                                resource[yy][xx] = true;
-                                remainResource++;
-                                setCell(xx, yy, '#');
-                            }
+                for(int row = 0; row < MAP_H; row++){
+                    for(int column = 0; column < MAP_W; column++){
+                        if(!resource[row][column] && rand() % 100 < RESOURCE_RATE){
+                            resource[row][column] = true;
+                            remainResource++;
                         }
                     }
                 }
             }
-    
-            //快捷键设置
-            if(KeyPressed('W') && y > 0)
-                y--; 
-            if(KeyPressed('S') && y < ACTIVE_H - 1)
-                y++;
-            if(KeyPressed('A') && x > 0)
-                x--;
-            if(KeyPressed('D') && x < ACTIVE_W - 1)
-                x++;
-            if(KeyPressed('E')){
-                if(resource[y][x]){
-                    resource[y][x] = false;
-                    remainResource--;
-                    resourceCount = resourceCount + 1;
+            if(KeyPressed('W') && y > 0) y--;
+            if(KeyPressed('S') && y < MAP_H - 1) y++;
+            if(KeyPressed('A') && x > 0) x--;
+            if(KeyPressed('D') && x < MAP_W - 1) x++;
+            if(KeyPressed('E') && resource[y][x]){
+                resource[y][x] = false;
+                remainResource--;
+                resourceCount++;
+            }
+        }
+        bool changed = resized || scene != oldScene || x != oldX || y != oldY ||
+                       resourceCount != oldResourceCount || remainResource != oldRemainResource;
+        if(changed){
+            fill(frame.begin(), frame.end(), blank);
+            needsPresent = true;
+            if(!canPlay){
+                writeText(0, 0, "Resize terminal: minimum 32 x 12", width);
+                writeText(0, 1, "Q Quit", width);
+            }
+            else if(scene == 0){
+                bool sidebar = width >= 80;
+                int viewW = min(MAP_W, width - (sidebar ? 31 : 0));
+                int viewH = min(MAP_H, height - (sidebar ? 0 : 6));
+                int cameraX = clamp(x - viewW / 2, 0, MAP_W - viewW);
+                int cameraY = clamp(y - viewH / 2, 0, MAP_H - viewH);
+                for(int row = 0; row < viewH; row++){
+                    for(int column = 0; column < viewW; column++){
+                        int mapX = cameraX + column;
+                        int mapY = cameraY + row;
+                        char value = mapX == x && mapY == y ? '@' :
+                                     (resource[mapY][mapX] ? '#' : ' ');
+                        setCell(column, row, value);
+                    }
+                }
+                string position = "X:" + to_string(x) + " Y:" + to_string(y);
+                if(sidebar){
+                    for(int row = 0; row < height; row++)
+                        setCell(viewW, row, '|');
+                    int column = viewW + 1;
+                    int infoWidth = width - column;
+                    writeText(column, 0, "PYS", infoWidth);
+                    writeText(column, 2, position, infoWidth);
+                    writeText(column, 3, "Collected:" + to_string(resourceCount), infoWidth);
+                    writeText(column, 4, "Remaining:" + to_string(remainResource), infoWidth);
+                    writeText(column, 6, "Map:128 x 32", infoWidth);
+                    writeText(column, 7, "View:" + to_string(viewW) + " x " + to_string(viewH), infoWidth);
+                    writeText(column, 9, "WASD Move  E Collect", infoWidth);
+                    writeText(column, 10, "Right Shop  Q Quit", infoWidth);
+                }
+                else{
+                    for(int column = 0; column < width; column++)
+                        setCell(column, viewH, '-');
+                    writeText(0, viewH + 1, position, width);
+                    writeText(0, viewH + 2, "Collected:" + to_string(resourceCount), width);
+                    writeText(0, viewH + 3, "Remaining:" + to_string(remainResource), width);
+                    writeText(0, viewH + 4, "WASD Move  E Collect", width);
+                    writeText(0, viewH + 5, "Right Shop  Q Quit", width);
                 }
             }
-
-            if(x != oldX || y != oldY)
-                setCell(oldX, oldY, resource[oldY][oldX] ? '#' : ' ');
-            setCell(x, y, '@');
-
-            //坐标信息
-            if(sceneChanged || x != oldX)
-                writeInfo(2, "X:" + to_string(x));
-            if(sceneChanged || y != oldY)
-                writeInfo(3, "Y:" + to_string(y));
-            //获得资源数
-            if(sceneChanged || resourceCount != oldResourceCount)
-                writeInfo(4, "Resource count:" + to_string(resourceCount));
-            //剩余资源数
-            if(sceneChanged || remainResource != oldRemainResource)
-                writeInfo(5, "Remain resource count:" + to_string(remainResource));
-            if(sceneChanged){
-                writeInfo(6, "The map area : " + to_string(ACTIVE_W) + " x " + to_string(ACTIVE_H));
-                writeInfo(7, "The info bar area : " + to_string(INFO_STARTPOS + 1) + " ~ " + to_string(BUF_W));
-                writeInfo(9, "Press 'rightarrow' for shop");
+            else{
+                int shopWidth = min(48, width - 2);
+                int column = (width - shopWidth) / 2;
+                int row = (height - 9) / 2;
+                writeText(column, row, "========== SHOP ==========", shopWidth);
+                writeText(column, row + 2, "Auto Robot: 100 resources", shopWidth);
+                writeText(column, row + 3, "Purchase not implemented", shopWidth);
+                writeText(column, row + 4, "Owned Bots: 0", shopWidth);
+                writeText(column, row + 6, "Collected:" + to_string(resourceCount), shopWidth);
+                writeText(column, row + 8, "Left Game   Q Quit", shopWidth);
             }
         }
-        else if(scene == 1 && sceneChanged){
-            auto writeShop = [&](int row, const string& text){
-                writeText(10, row, text, static_cast<int>(text.size()));
-            };
-            writeShop(5, "==========<<SHOP>>==========");
-            writeShop(7, "Auto Robot: purchase 100 resource to buy 1");
-            writeShop(9, "Owned Bots: 0");
-            writeShop(11, "resource count: " + to_string(resourceCount));
-            writeShop(13, "Press 'leftarrow' for gamescene");
-        }
         present();
-        firstFrame = false;
         Sleep(30);
     }
-    return 0;
+    if(restoreCursor)
+        SetConsoleCursorInfo(hConsole, &originalCursor);
+    return exitCode;
 }
