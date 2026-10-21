@@ -2,6 +2,8 @@
 #include <windows.h>
 #include <cstdlib>
 #include <ctime>
+#include <iomanip>
+#include <string>
 using namespace std;
 
 bool KeyPressed(int key){
@@ -16,21 +18,23 @@ int main(){
     SetConsoleCursorInfo(hConsole, &cursorInfo);
     
     //定义范围
-    const int ACTIVE_W = 127;
+    const int ACTIVE_W = 128;
     const int ACTIVE_H = 32;
-    const int INFO_STARTPOS = ACTIVE_W + 1;
+    const int INFO_STARTPOS = ACTIVE_W;
     const int INFO_W = 96;
     const int BUF_W = ACTIVE_W + INFO_W;
     const int BUF_H = ACTIVE_H;
 
     //定义物资
-    bool resource[33][129] = {false};
+    bool resource[ACTIVE_H][ACTIVE_W] = {false};
+    int remainResource = 0;
     srand((unsigned int)time(NULL));
     const int RESOURCE_RATE = 6;
-    for(int y = 0; y <= ACTIVE_H; y++){
-        for(int x = 0; x <= ACTIVE_W; x++){
+    for(int y = 0; y < ACTIVE_H; y++){
+        for(int x = 0; x < ACTIVE_W; x++){
             if(rand() % 100 < RESOURCE_RATE){
                 resource[y][x] = true;
+                remainResource++;
             }
         }
     }
@@ -50,17 +54,30 @@ int main(){
     SetConsoleWindowInfo(hConsole, TRUE, &windowRect);
     
     //绘制资源
-    for(int y = 0; y <= ACTIVE_H; y++){
-        for(int x = 0; x <= ACTIVE_W; x++){
-            if(resource[y][x]){
-                COORD pos;
-                pos.X = x;
-                pos.Y = y;
-                SetConsoleCursorPosition(hConsole, pos);
-                cout<<"#";
+    auto drawResources = [&](){
+        for(int y = 0; y < ACTIVE_H; y++){
+            for(int x = 0; x < ACTIVE_W; x++){
+                if(resource[y][x]){
+                    COORD pos;
+                    pos.X = x;
+                    pos.Y = y;
+                    SetConsoleCursorPosition(hConsole, pos);
+                    cout<<"#";
+                }
             }
         }
-    }
+    };
+    drawResources();
+
+    auto clearScreen = [&](){
+        DWORD written;
+        FillConsoleOutputCharacterA(hConsole, ' ', BUF_W * BUF_H,
+                                    COORD{0, 0}, &written);
+    };
+    auto writeInfo = [&](SHORT row, const string& text){
+        SetConsoleCursorPosition(hConsole, COORD{INFO_STARTPOS, row});
+        cout << left << setw(INFO_W) << text;
+    };
     
     //禁止拖拽
     HWND hWdn = GetConsoleWindow();
@@ -74,33 +91,32 @@ int main(){
     int oldX = x;
     int oldY = y;
     int resourceCount = 0;
-    int remainResource = 0;
-    bool isRefilling = false;
     int scene = 0;
 
     //游戏循环
     while(true){
+        if(KeyPressed('Q'))
+            break;
+        int oldScene = scene;
         if(KeyPressed(VK_RIGHT)){
             scene = 1;
-            system("cls");
         }
         if(KeyPressed(VK_LEFT)){
             scene = 0;
-            system("cls");
+        }
+        if(scene != oldScene){
+            clearScreen();
+            if(scene == 0)
+                drawResources();
         }
         if(scene == 0){
-            int remainResource = 0;
-            for(int yy = 0; yy <= ACTIVE_H; yy++){
-                for(int xx = 0; xx <= ACTIVE_W; xx++){
-                    if(resource[yy][xx]) remainResource++;
-                }
-            }
-            if(remainResource <= 50 && !isRefilling){
-                for(int yy = 0; yy <= ACTIVE_H; yy++){
-                    for (int xx = 0; xx <= ACTIVE_W; xx++){
+            if(remainResource <= 50){
+                for(int yy = 0; yy < ACTIVE_H; yy++){
+                    for (int xx = 0; xx < ACTIVE_W; xx++){
                         if(!resource[yy][xx]){
                             if(rand() % 100 < RESOURCE_RATE){
                                 resource[yy][xx] = true;
+                                remainResource++;
                                 COORD pos;
                                 pos.X = xx;
                                 pos.Y = yy;
@@ -109,15 +125,10 @@ int main(){
                             }
                         }
                     }
-                
                 }
-                isRefilling = true;
-            }    
-            if(remainResource > 50){
-                isRefilling = false;
             }
     
-    //快捷键设置
+            //快捷键设置
             if(KeyPressed('W') && y > 0)
                 y--; 
             if(KeyPressed('S') && y < ACTIVE_H - 1)
@@ -126,11 +137,10 @@ int main(){
                 x--;
             if(KeyPressed('D') && x < ACTIVE_W - 1)
                 x++;
-            if(KeyPressed('Q'))
-                break;
             if(KeyPressed('E')){
                 if(resource[y][x]){
                     resource[y][x] = false;
+                    remainResource--;
                     resourceCount = resourceCount + 1;
                     COORD clearPos;
                     clearPos.X = x;
@@ -157,35 +167,19 @@ int main(){
             oldX = x;
             oldY = y;
 
-            COORD infoPos;
             //坐标信息
-            infoPos.X = ACTIVE_W;
-            infoPos.Y = 2;
-            SetConsoleCursorPosition(hConsole, infoPos);
-            cout<<"X:"<<x;
-            infoPos.Y = 3;
-            SetConsoleCursorPosition(hConsole, infoPos);
-            cout<<"Y:"<<y;
+            writeInfo(2, "X:" + to_string(x));
+            writeInfo(3, "Y:" + to_string(y));
             //获得资源数
-            infoPos.Y = 4;
-            SetConsoleCursorPosition(hConsole, infoPos);
-            cout<<"Resource count:"<<resourceCount;
+            writeInfo(4, "Resource count:" + to_string(resourceCount));
             //剩余资源数
-            infoPos.Y = 5;
-            SetConsoleCursorPosition(hConsole, infoPos);
-            cout<<"Remain resource count:"<<remainResource;
+            writeInfo(5, "Remain resource count:" + to_string(remainResource));
             //可游玩范围
-            infoPos.Y = 6;
-            SetConsoleCursorPosition(hConsole, infoPos);
-            cout<<"The map area : 128 x 32";
+            writeInfo(6, "The map area : " + to_string(ACTIVE_W) + " x " + to_string(ACTIVE_H));
             //信息栏范围
-            infoPos.Y = 7; 
-            SetConsoleCursorPosition(hConsole, infoPos);
-            cout<<"The info bar area : 129 ~ 233";
+            writeInfo(7, "The info bar area : " + to_string(INFO_STARTPOS + 1) + " ~ " + to_string(BUF_W));
             //提示商店页面
-            infoPos.Y = 9; 
-            SetConsoleCursorPosition(hConsole, infoPos);
-            cout<<"Press 'rightarrow' for shop";
+            writeInfo(9, "Press 'rightarrow' for shop");
         }
         else if(scene == 1){
             COORD shopPos;
