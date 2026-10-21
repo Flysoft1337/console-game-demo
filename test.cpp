@@ -3,6 +3,7 @@
 #endif
 #include <windows.h>
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -10,15 +11,21 @@
 #include <vector>
 using namespace std;
 
-bool KeyPressed(int key){
-    return GetAsyncKeyState(key) & 0x8000;
-}
-
 int main(){
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE hInput = GetStdHandle(STD_INPUT_HANDLE);
     CONSOLE_SCREEN_BUFFER_INFO consoleInfo;
-    if(!GetConsoleScreenBufferInfo(hConsole, &consoleInfo)){
+    DWORD originalInputMode;
+    if(!GetConsoleScreenBufferInfo(hConsole, &consoleInfo) ||
+       !GetConsoleMode(hInput, &originalInputMode)){
         fputs("PYS requires an interactive Windows console.\n", stderr);
+        return 1;
+    }
+    DWORD inputMode = (originalInputMode | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT) &
+                      ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_QUICK_EDIT_MODE |
+                        ENABLE_VIRTUAL_TERMINAL_INPUT);
+    if(!SetConsoleMode(hInput, inputMode)){
+        fputs("PYS could not configure console input.\n", stderr);
         return 1;
     }
     CONSOLE_CURSOR_INFO originalCursor;
@@ -112,12 +119,46 @@ int main(){
     int resourceCount = 0;
     int scene = 0;
     int exitCode = 0;
+    array<INPUT_RECORD, 64> inputRecords;
+    vector<KEY_EVENT_RECORD> keys;
     while(true){
-        if(KeyPressed('Q'))
-            break;
-        if(!GetConsoleScreenBufferInfo(hConsole, &consoleInfo)){
+        //只消费本终端的按键,不读取其他窗口中的全局键盘状态。
+        keys.clear();
+        DWORD pending = 0;
+        if(!GetNumberOfConsoleInputEvents(hInput, &pending)){
             exitCode = 1;
             break;
+        }
+        while(pending > 0){
+            DWORD read = 0;
+            DWORD count = min<DWORD>(pending, static_cast<DWORD>(inputRecords.size()));
+            if(!ReadConsoleInputW(hInput, inputRecords.data(), count, &read) || read == 0){
+                exitCode = 1;
+                break;
+            }
+            pending -= read;
+            for(DWORD index = 0; index < read; index++){
+                const auto& record = inputRecords[index];
+                //焦点、鼠标、窗口事件均已消费,不把它们当作退出指令。
+                if(record.EventType != KEY_EVENT)
+                    continue;
+                const auto& key = record.Event.KeyEvent;
+                if(key.bKeyDown && !(key.dwControlKeyState &
+                   (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED | LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)))
+                    keys.push_back(key);
+            }
+        }
+        if(exitCode != 0 || any_of(keys.begin(), keys.end(), [](const KEY_EVENT_RECORD& key){
+            return key.wVirtualKeyCode == 'Q';
+        }))
+            break;
+        if(!GetConsoleScreenBufferInfo(hConsole, &consoleInfo)){
+            if(GetLastError() == ERROR_INVALID_HANDLE){
+                exitCode = 1;
+                break;
+            }
+            Sleep(30);
+            continue;
         }
         const SMALL_RECT current = consoleInfo.srWindow;
         bool resized = current.Left != viewport.Left || current.Top != viewport.Top ||
@@ -139,8 +180,23 @@ int main(){
         int oldY = y;
         int oldResourceCount = resourceCount;
         int oldRemainResource = remainResource;
-        if(KeyPressed(VK_RIGHT)) scene = 1;
-        if(KeyPressed(VK_LEFT)) scene = 0;
+        for(const auto& key : keys){
+            int code = key.wVirtualKeyCode;
+            int repeat = max<int>(1, key.wRepeatCount);
+            if(code == VK_RIGHT) scene = 1;
+            if(code == VK_LEFT) scene = 0;
+            if(!canPlay || scene != 0)
+                continue;
+            if(code == 'W') y = max(0, y - repeat);
+            if(code == 'S') y = min(MAP_H - 1, y + repeat);
+            if(code == 'A') x = max(0, x - repeat);
+            if(code == 'D') x = min(MAP_W - 1, x + repeat);
+            if(code == 'E' && resource[y][x]){
+                resource[y][x] = false;
+                remainResource--;
+                resourceCount++;
+            }
+        }
         if(canPlay && scene == 0){
             if(remainResource <= 50){
                 for(int row = 0; row < MAP_H; row++){
@@ -151,15 +207,6 @@ int main(){
                         }
                     }
                 }
-            }
-            if(KeyPressed('W') && y > 0) y--;
-            if(KeyPressed('S') && y < MAP_H - 1) y++;
-            if(KeyPressed('A') && x > 0) x--;
-            if(KeyPressed('D') && x < MAP_W - 1) x++;
-            if(KeyPressed('E') && resource[y][x]){
-                resource[y][x] = false;
-                remainResource--;
-                resourceCount++;
             }
         }
         bool changed = resized || scene != oldScene || x != oldX || y != oldY ||
@@ -228,5 +275,7 @@ int main(){
     }
     if(restoreCursor)
         SetConsoleCursorInfo(hConsole, &originalCursor);
+    FlushConsoleInputBuffer(hInput);
+    SetConsoleMode(hInput, originalInputMode);
     return exitCode;
 }
