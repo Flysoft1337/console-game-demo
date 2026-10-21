@@ -4,12 +4,23 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <string>
 #include <vector>
 using namespace std;
+
+atomic<bool> exitRequested{false};
+
+BOOL WINAPI HandleConsoleControl(DWORD event){
+    if(event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT)
+        return FALSE;
+    //回调运行在系统线程中,这里只通知主循环,由主线程统一清理。
+    exitRequested.store(true, memory_order_relaxed);
+    return TRUE;
+}
 
 int main(){
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -21,10 +32,16 @@ int main(){
         fputs("PYS requires an interactive Windows console.\n", stderr);
         return 1;
     }
-    DWORD inputMode = (originalInputMode | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT) &
+    if(!SetConsoleCtrlHandler(HandleConsoleControl, TRUE)){
+        fputs("PYS could not configure console exit handling.\n", stderr);
+        return 1;
+    }
+    DWORD inputMode = (originalInputMode | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT |
+                      ENABLE_PROCESSED_INPUT) &
                       ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_QUICK_EDIT_MODE |
                         ENABLE_VIRTUAL_TERMINAL_INPUT);
     if(!SetConsoleMode(hInput, inputMode)){
+        SetConsoleCtrlHandler(HandleConsoleControl, FALSE);
         fputs("PYS could not configure console input.\n", stderr);
         return 1;
     }
@@ -121,7 +138,7 @@ int main(){
     int exitCode = 0;
     array<INPUT_RECORD, 64> inputRecords;
     vector<KEY_EVENT_RECORD> keys;
-    while(true){
+    while(!exitRequested.load(memory_order_relaxed)){
         //只消费本终端的按键,不读取其他窗口中的全局键盘状态。
         keys.clear();
         DWORD pending = 0;
@@ -129,7 +146,7 @@ int main(){
             exitCode = 1;
             break;
         }
-        while(pending > 0){
+        while(pending > 0 && !exitRequested.load(memory_order_relaxed)){
             DWORD read = 0;
             DWORD count = min<DWORD>(pending, static_cast<DWORD>(inputRecords.size()));
             if(!ReadConsoleInputW(hInput, inputRecords.data(), count, &read) || read == 0){
@@ -273,9 +290,22 @@ int main(){
         present();
         Sleep(30);
     }
+    //两种退出方式共用此路径,只清除当前可见区域,保留终端滚动历史。
+    CONSOLE_SCREEN_BUFFER_INFO exitInfo;
+    if(GetConsoleScreenBufferInfo(hConsole, &exitInfo)){
+        COORD clearSize = {
+            static_cast<SHORT>(exitInfo.srWindow.Right - exitInfo.srWindow.Left + 1),
+            static_cast<SHORT>(exitInfo.srWindow.Bottom - exitInfo.srWindow.Top + 1)
+        };
+        vector<CHAR_INFO> clearFrame(static_cast<size_t>(clearSize.X) * clearSize.Y, blank);
+        SMALL_RECT target = exitInfo.srWindow;
+        WriteConsoleOutputA(hConsole, clearFrame.data(), clearSize, COORD{0, 0}, &target);
+        SetConsoleCursorPosition(hConsole, COORD{exitInfo.srWindow.Left, exitInfo.srWindow.Top});
+    }
     if(restoreCursor)
         SetConsoleCursorInfo(hConsole, &originalCursor);
     FlushConsoleInputBuffer(hInput);
     SetConsoleMode(hInput, originalInputMode);
+    SetConsoleCtrlHandler(HandleConsoleControl, FALSE);
     return exitCode;
 }
